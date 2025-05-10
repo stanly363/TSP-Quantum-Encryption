@@ -1,196 +1,200 @@
-import base64
-import hmac
-import hashlib
-import json
-import os
-import random
-import numpy as np
+import base64, hmac, hashlib, json, os, random, numpy as np
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+# ---------------- Key Setup ----------------
 
 def generate_graph(n=50, max_distance=100):
-    graph = np.random.randint(1, max_distance, size=(n, n))
-    np.fill_diagonal(graph, 0)
-    graph = (graph + graph.T) // 2  # Make symmetric
-    return graph.tolist()  # Convert to list for JSON compatibility
+    g = np.random.randint(1, max_distance, size=(n, n))
+    np.fill_diagonal(g, 0)
+    return ((g + g.T) // 2).tolist()
 
 def generate_optimal_tour(n=50):
     tour = list(range(n))
     random.shuffle(tour)
     return tour
 
-import hashlib
+def generate_noisy_tour(tour, level=0.7):
+    t = tour.copy()
+    for _ in range(int(len(t) * level)):
+        i, j = random.sample(range(len(t)), 2)
+        t[i], t[j] = t[j], t[i]
+    return t
 
-def generate_noisy_tour(optimal_tour, noise_level=0.3):
-    """Obfuscate the tour by introducing random swaps."""
-    tour = optimal_tour.copy()
-    n_swaps = int(len(tour) * noise_level)
-    for _ in range(n_swaps):
-        i, j = random.sample(range(len(tour)), 2)
-        tour[i], tour[j] = tour[j], tour[i]
-    return tour
+def add_padding(tour, extra=10, n=50):
+    return tour + [random.randint(0, n - 1) for _ in range(extra)]
 
-def derive_shared_key(my_tour, received_noisy_tour):
-    """Derives a shared key by XORing both tours and hashing."""
-    combined = [a ^ b for a, b in zip(my_tour, received_noisy_tour)]
-    combined_bytes = bytes(combined)
-    return hashlib.sha256(combined_bytes).digest()
+def derive_shared_key_symmetric_with_nonce(tour1, tour2, nonce):
+    combined = bytes(sorted(tour1) + sorted(tour2))
+    return hashlib.sha256(nonce + combined).digest()
 
-def derive_shared_key_symmetric(tour1, tour2):
-    """
-    Deterministically derive the same shared key from two tours by:
-    - Sorting both tours
-    - Concatenating
-    - Hashing the result
-    """
-    sorted1 = sorted(tour1)
-    sorted2 = sorted(tour2)
-    combined = bytes(sorted1 + sorted2)
-    return hashlib.sha256(combined).digest()
+# ---------------- Signature ----------------
 
+def generate_signing_keypair():
+    priv = ed25519.Ed25519PrivateKey.generate()
+    pub = priv.public_key()
+    return priv, pub
 
-def save_hmac_key(key: bytes, path="keys/hmac_key.key"):
-    """Save HMAC key to a file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(key)
+def save_signing_keys(priv, pub, dir="keys"):
+    os.makedirs(dir, exist_ok=True)
+    with open(f"{dir}/private_signing_key.pem", "wb") as f:
+        f.write(priv.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    with open(f"{dir}/public_verification_key.pem", "wb") as f:
+        f.write(pub.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
 
-def load_hmac_key(path="keys/hmac_key.key") -> bytes:
-    """Load HMAC key from a file."""
-    with open(path, "rb") as f:
-        return f.read()
+def load_signing_keys():
+    with open("keys/private_signing_key.pem", "rb") as f:
+        priv = serialization.load_pem_private_key(f.read(), password=None)
+    with open("keys/public_verification_key.pem", "rb") as f:
+        pub = serialization.load_pem_public_key(f.read())
+    return priv, pub
 
+# ---------------- Crypto Utilities ----------------
 
-def save_key_pair(graph, optimal_tour, directory="keys"):
-    os.makedirs(directory, exist_ok=True)
-    with open(os.path.join(directory, "public_key.json"), "w") as pub_file:
-        json.dump({"graph": graph}, pub_file)
-    with open(os.path.join(directory, "private_key.json"), "w") as priv_file:
-        json.dump({"optimal_tour": optimal_tour}, priv_file)
+def aes_encrypt(plaintext, key):
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(key), modes.CFB(iv))
+    encryptor = cipher.encryptor()
+    return iv + encryptor.update(plaintext.encode()) + encryptor.finalize()
 
-def load_public_key(path="keys/public_key.json"):
-    with open(path, "r") as f:
-        return json.load(f)["graph"]
+def aes_decrypt(ciphertext, key):
+    iv, ct = ciphertext[:16], ciphertext[16:]
+    cipher = Cipher(algorithms.AES(key), modes.CFB(iv))
+    decryptor = cipher.decryptor()
+    return (decryptor.update(ct) + decryptor.finalize()).decode()
 
-def load_private_key(path="keys/private_key.json"):
-    with open(path, "r") as f:
-        return json.load(f)["optimal_tour"]
+def compute_hmac(key, msg):
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
+def verify_hmac(key, msg, tag):
+    return hmac.compare_digest(compute_hmac(key, msg), tag)
 
-def b64encode(data: bytes) -> str:
-    return base64.b64encode(data).decode()
+def sign_payload(priv, data):
+    return priv.sign(data)
 
-def b64decode(data: str) -> bytes:
-    return base64.b64decode(data)
+def verify_signature(pub, data, sig):
+    try:
+        pub.verify(sig, data)
+        return True
+    except Exception:
+        return False
 
-def compute_hmac(key: bytes, message: bytes) -> str:
-    return hmac.new(key, message, hashlib.sha256).hexdigest()
+def b64e(b): return base64.b64encode(b).decode()
+def b64d(s): return base64.b64decode(s)
 
-def verify_hmac(key: bytes, message: bytes, tag: str) -> bool:
-    expected_tag = compute_hmac(key, message)
-    return hmac.compare_digest(expected_tag, tag)
+# ---------------- Legacy Tour-Based Encoder ----------------
 
-def generate_nonce(length=16):
-    return os.urandom(length)
-
-def encrypt(message, graph, optimal_tour, hmac_key):
+def tour_encode(message, tour, graph):
     bits = ''.join(f'{ord(c):08b}' for c in message)
-    tour_output = []
+    output = []
     idx = 0
-    n = len(graph)
-
-    nonce = generate_nonce()
-
     for bit in bits:
-        current_city = optimal_tour[idx % len(optimal_tour)]
+        curr = tour[idx % len(tour)]
         if bit == '0':
-            next_city = optimal_tour[(idx + 1) % len(optimal_tour)]
+            nxt = tour[(idx + 1) % len(tour)]
         else:
-            neighbors = list(set(range(n)) - {optimal_tour[(idx + 1) % len(optimal_tour)]})
-            next_city = random.choice(neighbors)
-        tour_output.append((current_city, next_city))
+            candidates = list(set(range(len(graph))) - {tour[(idx + 1) % len(tour)]})
+            nxt = random.choice(candidates)
+        output.append((curr, nxt))
         idx += 1
+    return output
 
-    # Serialize and encode ciphertext
-    payload = {
-        "nonce": b64encode(nonce),
-        "tour": tour_output
-    }
-    payload_bytes = json.dumps(payload).encode()
-    tag = compute_hmac(hmac_key, payload_bytes)
-
-    final_package = {
-        "payload": b64encode(payload_bytes),
-        "hmac": tag
-    }
-
-    return json.dumps(final_package)
-
-def decrypt(package_json, optimal_tour, hmac_key):
-    package = json.loads(package_json)
-    payload_bytes = b64decode(package["payload"])
-    tag = package["hmac"]
-
-    if not verify_hmac(hmac_key, payload_bytes, tag):
-        raise ValueError("Integrity check failed: HMAC does not match!")
-
-    payload = json.loads(payload_bytes.decode())
-    tour_output = payload["tour"]
-
+def tour_decode(tour_output, tour):
     bits = ''
     idx = 0
-    for current_city, next_city in tour_output:
-        expected_next = optimal_tour[(idx + 1) % len(optimal_tour)]
-        bits += '0' if next_city == expected_next else '1'
+    for curr, nxt in tour_output:
+        expected = tour[(idx + 1) % len(tour)]
+        bits += '0' if nxt == expected else '1'
         idx += 1
-
     chars = [chr(int(bits[i:i+8], 2)) for i in range(0, len(bits), 8)]
     return ''.join(chars)
 
-# --- Key Management ---
+# ---------------- Key Exchange ----------------
 
-# Shared graph
-graph = generate_graph()
+def simulate_key_exchange():
+    # Alice's private tour and noisy version
+    alice_tour = generate_optimal_tour()
+    alice_noisy = add_padding(generate_noisy_tour(alice_tour), 10)
+    nonce = os.urandom(16)  # Alice chooses the nonce
 
-# Alice and Bob's private tours
-alice_tour = generate_optimal_tour()
-bob_tour = generate_optimal_tour()
+    # Alice sends (alice_noisy, nonce) to Bob
 
-# Each sends a noisy tour to the other
-alice_noisy = generate_noisy_tour(alice_tour)
-bob_noisy = generate_noisy_tour(bob_tour)
+    # Bob's private tour and key derivation using Alice's noisy tour
+    bob_tour = generate_optimal_tour()
+    bob_key = derive_shared_key_symmetric_with_nonce(bob_tour, alice_noisy, nonce)
 
-# Alice derives the key using her private + Bob's noisy tour
-alice_shared_key = derive_shared_key_symmetric(alice_tour, bob_noisy)
+    # Alice derives the same key using her private tour and nonce
+    alice_key = derive_shared_key_symmetric_with_nonce(alice_tour, alice_noisy, nonce)
 
-# Bob derives the key using his private + Alice's noisy tour
-bob_shared_key = derive_shared_key_symmetric(bob_tour, alice_noisy)
+    # Assert that both keys are the same
+    assert alice_key == bob_key, "Key mismatch!"
 
-print("Do shared keys match?", alice_shared_key == bob_shared_key)
+    return alice_key, nonce, alice_tour, bob_tour
 
 
-# Generate and save keys (only once)
-graph = generate_graph()
-optimal_tour = generate_optimal_tour()
-save_key_pair(graph, optimal_tour)
+# ---------------- Main ----------------
 
-# Generate and save HMAC key (only once)
-hmac_key = os.urandom(32)
-save_hmac_key(hmac_key)
+def main():
+    if not os.path.exists("keys/private_signing_key.pem"):
+        priv, pub = generate_signing_keypair()
+        save_signing_keys(priv, pub)
+    else:
+        priv, pub = load_signing_keys()
 
-# --- In a new session or after restart ---
+    # TSP Key Exchange
+    shared_key, nonce, alice_tour, _ = simulate_key_exchange()
+    print("[✔] Shared Key:", shared_key.hex())
+    print("[✔] Nonce:", nonce.hex())
 
-# Load keys
-public_graph = load_public_key()
-private_tour = load_private_key()
-hmac_key = load_hmac_key()
+    # Graph for legacy tour encoding
+    graph = generate_graph()
+    print("[✔] Generated Graph and Tour")
 
-# Encrypt a message
-message = "Secure Message"
-ciphertext = encrypt(message, public_graph, private_tour, hmac_key)
-print("Ciphertext:", ciphertext)
+    # Legacy Tour-Based Encoding
+    legacy_tour_output = tour_encode("Legacy Test", alice_tour, graph)
+    print("[✔] Legacy Encoded Tour:", legacy_tour_output)
 
-# Decrypt the message
-try:
-    decrypted_message = decrypt(ciphertext, private_tour, hmac_key)
-    print("Decrypted message:", decrypted_message)
-except ValueError as e:
-    print("Integrity check failed:", str(e))
+    # AES-Based Encryption
+    aes_ciphertext = aes_encrypt("This is the AES encrypted message.", shared_key)
+    hmac_tag = compute_hmac(shared_key, aes_ciphertext)
+
+    package = {
+        "nonce": b64e(nonce),
+        "ciphertext": b64e(aes_ciphertext),
+        "hmac": hmac_tag,
+        "legacy_tour_output": legacy_tour_output
+    }
+
+    serialized = json.dumps(package).encode()
+    signature = sign_payload(priv, serialized)
+
+    final_message = {
+        "payload": b64e(serialized),
+        "signature": b64e(signature)
+    }
+
+    print("\n[✔] Final Signed & Encrypted Package:\n", json.dumps(final_message, indent=2))
+
+    # Receiving Simulation
+    print("\n[✔] Simulating Receiver...\n")
+    received = json.loads(json.dumps(final_message))
+    payload = json.loads(b64d(received["payload"]))
+    received_sig = b64d(received["signature"])
+
+    if verify_signature(pub, b64d(received["payload"]), received_sig):
+        print("[✔] Signature verified.")
+        nonce = b64d(payload["nonce"])
+        ciphertext = b64d(payload["ciphertext"])
+        if verify_hmac(shared_key, ciphertext, payload["hmac"]):
+            plaintext = aes_decrypt(ciphertext, shared_key)
+            print("[✔] AES Decrypted:", plaintext)
+            decoded_legacy = tour_decode(payload["legacy_tour_output"], alice_tour)
+            print("[✔] Legacy Decoded:", decoded_legacy)
+        else:
+            print("[❌] HMAC verification failed.")
+    else:
+        print("[❌] Signature verification failed.")
+
+if __name__ == "__main__":
+    main()
